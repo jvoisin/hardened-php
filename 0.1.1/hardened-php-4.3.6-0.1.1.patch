@@ -1,0 +1,1493 @@
+diff -Nur php-4.3.6.orig/Zend/zend.c hardened-php/Zend/zend.c
+--- php-4.3.6.orig/Zend/zend.c	Fri Apr 16 19:25:38 2004
++++ hardened-php/Zend/zend.c	Sun May 16 00:33:40 2004
+@@ -53,6 +53,12 @@
+ ZEND_API void (*zend_unblock_interruptions)(void);
+ ZEND_API void (*zend_ticks_function)(int ticks);
+ ZEND_API void (*zend_error_cb)(int type, const char *error_filename, const uint error_lineno, const char *format, va_list args);
++#if HARDENED_PHP
++ZEND_API void (*zend_security_log)(char *str);
++#endif
++#if HARDENED_PHP_INC_PROTECT
++ZEND_API int (*zend_is_valid_include)(zval *z);
++#endif
+ 
+ void (*zend_on_timeout)(int seconds TSRMLS_DC);
+ 
+@@ -422,6 +428,14 @@
+ #else
+ 	extern zend_scanner_globals ini_scanner_globals;
+ 	extern zend_scanner_globals language_scanner_globals;
++#endif
++
++	/* Set up Hardened-PHP utility functions first */
++#if HARDENED_PHP
++	zend_security_log = utility_functions->security_log_function;
++#endif
++#if HARDENED_PHP_INC_PROTECT
++	zend_is_valid_include = utility_functions->is_valid_include;
+ #endif
+ 
+ #ifdef ZTS
+diff -Nur php-4.3.6.orig/Zend/zend.h hardened-php/Zend/zend.h
+--- php-4.3.6.orig/Zend/zend.h	Fri Apr 16 19:25:38 2004
++++ hardened-php/Zend/zend.h	Sun May 16 00:33:40 2004
+@@ -324,6 +324,12 @@
+ 	void (*ticks_function)(int ticks);
+ 	void (*on_timeout)(int seconds TSRMLS_DC);
+ 	zend_bool (*open_function)(const char *filename, struct _zend_file_handle *);
++#if HARDENED_PHP
++	void (*security_log_function)(char *str);
++#endif	
++#if HARDENED_PHP_INC_PROTECT
++	int (*is_valid_include)(zval *z);
++#endif
+ } zend_utility_functions;
+ 
+ 		
+@@ -455,7 +461,16 @@
+ extern ZEND_API void (*zend_ticks_function)(int ticks);
+ extern ZEND_API void (*zend_error_cb)(int type, const char *error_filename, const uint error_lineno, const char *format, va_list args) ZEND_ATTRIBUTE_PTR_FORMAT(printf, 4, 0);
+ extern void (*zend_on_timeout)(int seconds TSRMLS_DC);
++#if HARDENED_PHP
++extern ZEND_API	void (*zend_security_log)(char *str);
++#endif	
++#if HARDENED_PHP_INC_PROTECT
++extern ZEND_API int (*zend_is_valid_include)(zval *z);
++#endif
+ 
++#if HARDENED_PHP_MM_PROTECT || HARDENED_PHP_LL_PROTECT
++ZEND_API unsigned int zend_canary(void);
++#endif
+ 
+ ZEND_API void zend_error(int type, const char *format, ...) ZEND_ATTRIBUTE_PTR_FORMAT(printf, 2, 3);
+ 
+diff -Nur php-4.3.6.orig/Zend/zend_alloc.c hardened-php/Zend/zend_alloc.c
+--- php-4.3.6.orig/Zend/zend_alloc.c	Fri Apr 16 19:25:38 2004
++++ hardened-php/Zend/zend_alloc.c	Sun May 16 00:41:04 2004
+@@ -56,6 +56,11 @@
+ # define END_MAGIC_SIZE 0
+ #endif
+ 
++#if HARDENED_PHP_MM_PROTECT
++# define CANARY_SIZE sizeof(unsigned int)
++#else
++# define CANARY_SIZE 0
++#endif
+ 
+ # if MEMORY_LIMIT
+ #  if ZEND_DEBUG
+@@ -129,6 +134,12 @@
+ 	DECLARE_CACHE_VARS();
+ 	TSRMLS_FETCH();
+ 
++#if HARDENED_PHP_MM_PROTECT
++	if (size > LONG_MAX - sizeof(zend_mem_header) - MEM_HEADER_PADDING - END_MAGIC_SIZE - CANARY_SIZE) {
++		zend_security_log("emalloc() - requested size would result in integer overflow");
++		exit(1);
++	}
++#endif
+ 	CALCULATE_REAL_SIZE_AND_CACHE_INDEX(size);
+ 
+ 	if (!ZEND_DISABLE_MEMORY_CACHE && (CACHE_INDEX < MAX_CACHED_MEMORY) && (AG(cache_count)[CACHE_INDEX] > 0)) {
+@@ -146,6 +157,10 @@
+ 		AG(cache_stats)[CACHE_INDEX][1]++;
+ 		memcpy((((char *) p) + sizeof(zend_mem_header) + MEM_HEADER_PADDING + size), &mem_block_end_magic, sizeof(long));
+ #endif
++#if HARDENED_PHP_MM_PROTECT
++		p->canary = AG(canary_1);
++		memcpy((((char *) p) + sizeof(zend_mem_header) + MEM_HEADER_PADDING + size + END_MAGIC_SIZE), &AG(canary_2), CANARY_SIZE);
++#endif
+ 		p->cached = 0;
+ 		p->size = size;
+ 		return (void *)((char *)p + sizeof(zend_mem_header) + MEM_HEADER_PADDING);
+@@ -155,7 +170,13 @@
+ 			AG(cache_stats)[CACHE_INDEX][0]++;
+ 		}
+ #endif
+-		p  = (zend_mem_header *) ZEND_DO_MALLOC(sizeof(zend_mem_header) + MEM_HEADER_PADDING + SIZE + END_MAGIC_SIZE);
++#if MEMORY_LIMIT
++		CHECK_MEMORY_LIMIT(size, SIZE);
++		if (AG(allocated_memory) > AG(allocated_memory_peak)) {
++			AG(allocated_memory_peak) = AG(allocated_memory);
++		}
++#endif
++		p  = (zend_mem_header *) ZEND_DO_MALLOC(sizeof(zend_mem_header) + MEM_HEADER_PADDING + SIZE + END_MAGIC_SIZE + CANARY_SIZE);
+ 	}
+ 
+ 	HANDLE_BLOCK_INTERRUPTIONS();
+@@ -185,11 +206,9 @@
+ # endif
+ 	memcpy((((char *) p) + sizeof(zend_mem_header) + MEM_HEADER_PADDING + size), &mem_block_end_magic, sizeof(long));
+ #endif
+-#if MEMORY_LIMIT
+-	CHECK_MEMORY_LIMIT(size, SIZE);
+-	if (AG(allocated_memory) > AG(allocated_memory_peak)) {
+-		AG(allocated_memory_peak) = AG(allocated_memory);
+-	}
++#if HARDENED_PHP_MM_PROTECT
++	p->canary = AG(canary_1);
++	memcpy((((char *) p) + sizeof(zend_mem_header) + MEM_HEADER_PADDING + size + END_MAGIC_SIZE), &AG(canary_2), CANARY_SIZE);
+ #endif
+ 
+ 	HANDLE_UNBLOCK_INTERRUPTIONS();
+@@ -218,17 +237,33 @@
+ 			return emalloc_rel(lval + offset);
+ 		}
+ 	}
+-
++	
++#if HARDENED_PHP
++	zend_security_log("Possible integer overflow catched by safe_emalloc()");
++#endif
+ 	zend_error(E_ERROR, "Possible integer overflow in memory allocation (%ld * %ld + %ld)", nmemb, size, offset);
+ 	return 0;
+ }
+ 
+ ZEND_API void _efree(void *ptr ZEND_FILE_LINE_DC ZEND_FILE_LINE_ORIG_DC)
+ {
++#if HARDENED_PHP_MM_PROTECT
++	unsigned int *canary_2;
++#endif
+ 	zend_mem_header *p = (zend_mem_header *) ((char *)ptr - sizeof(zend_mem_header) - MEM_HEADER_PADDING);
+ 	DECLARE_CACHE_VARS();
+ 	TSRMLS_FETCH();
+ 
++#if HARDENED_PHP_MM_PROTECT
++	canary_2 = (((char *) p) + sizeof(zend_mem_header) + MEM_HEADER_PADDING + p->size + END_MAGIC_SIZE);
++	if (p->canary != AG(canary_1) || *canary_2 != AG(canary_2)) {
++		zend_security_log("canary mismatch on efree() - heap overflow or double efree detected");
++		exit(1);
++	}
++	/* to catch double efree()s */
++	*canary_2 = p->canary = 0;
++#endif
++
+ #if defined(ZTS) && TSRM_DEBUG
+ 	if (p->thread_id != tsrm_thread_id()) {
+ 		tsrm_error(TSRM_ERROR_LEVEL_ERROR, "Memory block allocated at %s:(%d) on thread %x freed at %s:(%d) on thread %x, ignoring",
+@@ -273,6 +308,9 @@
+ 	size_t _size = nmemb * size;
+     
+ 	if (nmemb && (_size/nmemb!=size)) {
++#if HARDENED_PHP
++		zend_security_log("Possible integer overflow catched by ecalloc()");
++#endif
+ 		fprintf(stderr,"FATAL:  ecalloc():  Unable to allocate %ld * %ld bytes\n", (long) nmemb, (long) size);
+ #if ZEND_DEBUG && HAVE_KILL && HAVE_GETPID
+ 		kill(getpid(), SIGSEGV);
+@@ -292,6 +330,9 @@
+ 
+ ZEND_API void *_erealloc(void *ptr, size_t size, int allow_failure ZEND_FILE_LINE_DC ZEND_FILE_LINE_ORIG_DC)
+ {
++#if HARDENED_PHP_MM_PROTECT
++	unsigned int canary_2;
++#endif
+ 	zend_mem_header *p;
+ 	zend_mem_header *orig;
+ 	DECLARE_CACHE_VARS();
+@@ -303,6 +344,14 @@
+ 
+ 	p = orig = (zend_mem_header *) ((char *)ptr-sizeof(zend_mem_header)-MEM_HEADER_PADDING);
+ 
++#if HARDENED_PHP_MM_PROTECT
++	canary_2 = *(unsigned int *)(((char *) p) + sizeof(zend_mem_header) + MEM_HEADER_PADDING + p->size + END_MAGIC_SIZE);
++	if (p->canary != AG(canary_1) || canary_2 != AG(canary_2)) {
++		zend_security_log("canary mismatch on erealloc() - heap overflow detected");
++		exit(1);
++	}
++#endif
++
+ #if defined(ZTS) && TSRM_DEBUG
+ 	if (p->thread_id != tsrm_thread_id()) {
+ 		void *new_p;
+@@ -319,8 +368,14 @@
+ 	CALCULATE_REAL_SIZE_AND_CACHE_INDEX(size);
+ 
+ 	HANDLE_BLOCK_INTERRUPTIONS();
++#if MEMORY_LIMIT
++	CHECK_MEMORY_LIMIT(size - p->size, SIZE - REAL_SIZE(p->size));
++	if (AG(allocated_memory) > AG(allocated_memory_peak)) {
++		AG(allocated_memory_peak) = AG(allocated_memory);
++	}
++#endif
+ 	REMOVE_POINTER_FROM_LIST(p);
+-	p = (zend_mem_header *) ZEND_DO_REALLOC(p, sizeof(zend_mem_header)+MEM_HEADER_PADDING+SIZE+END_MAGIC_SIZE);
++	p = (zend_mem_header *) ZEND_DO_REALLOC(p, sizeof(zend_mem_header)+MEM_HEADER_PADDING+SIZE+END_MAGIC_SIZE+CANARY_SIZE);
+ 	if (!p) {
+ 		if (!allow_failure) {
+ 			fprintf(stderr,"FATAL:  erealloc():  Unable to allocate %ld bytes\n", (long) size);
+@@ -341,14 +396,11 @@
+ 	p->magic = MEM_BLOCK_START_MAGIC;
+ 	memcpy((((char *) p) + sizeof(zend_mem_header) + MEM_HEADER_PADDING + size), &mem_block_end_magic, sizeof(long));
+ #endif	
+-#if MEMORY_LIMIT
+-	CHECK_MEMORY_LIMIT(size - p->size, SIZE - REAL_SIZE(p->size));
+-	if (AG(allocated_memory) > AG(allocated_memory_peak)) {
+-		AG(allocated_memory_peak) = AG(allocated_memory);
+-	}
+-#endif
+ 
+ 	p->size = size;
++#if HARDENED_PHP_MM_PROTECT
++	memcpy((((char *) p) + sizeof(zend_mem_header) + MEM_HEADER_PADDING + size + END_MAGIC_SIZE), &AG(canary_2), CANARY_SIZE);
++#endif
+ 
+ 	HANDLE_UNBLOCK_INTERRUPTIONS();
+ 	return (void *)((char *)p+sizeof(zend_mem_header)+MEM_HEADER_PADDING);
+@@ -423,6 +475,10 @@
+ {
+ 	AG(head) = NULL;
+ 	
++#if HARDENED_PHP_MM_PROTECT
++	AG(canary_1) = zend_canary();
++	AG(canary_2) = zend_canary();
++#endif
+ #if MEMORY_LIMIT
+ 	AG(memory_limit) = 1<<30;		/* ridiculous limit, effectively no limit */
+ 	AG(allocated_memory) = 0;
+diff -Nur php-4.3.6.orig/Zend/zend_alloc.h hardened-php/Zend/zend_alloc.h
+--- php-4.3.6.orig/Zend/zend_alloc.h	Fri Apr 16 19:25:38 2004
++++ hardened-php/Zend/zend_alloc.h	Sun May 16 00:33:40 2004
+@@ -32,6 +32,9 @@
+ #define MEM_BLOCK_CACHED_MAGIC	0xFB8277DCL
+ 
+ typedef struct _zend_mem_header {
++#if HARDENED_PHP_MM_PROTECT
++	unsigned int canary;
++#endif
+ #if ZEND_DEBUG
+ 	long magic;
+ 	char *filename;
+diff -Nur php-4.3.6.orig/Zend/zend_builtin_functions.c hardened-php/Zend/zend_builtin_functions.c
+--- php-4.3.6.orig/Zend/zend_builtin_functions.c	Fri Apr 16 19:25:38 2004
++++ hardened-php/Zend/zend_builtin_functions.c	Sun May 16 00:33:40 2004
+@@ -49,6 +49,9 @@
+ static ZEND_FUNCTION(crash);
+ #endif
+ #endif
++#if HARDENED_PHP_MM_PROTECT_DEBUG
++static ZEND_FUNCTION(heap_overflow);
++#endif
+ static ZEND_FUNCTION(get_included_files);
+ static ZEND_FUNCTION(is_subclass_of);
+ static ZEND_FUNCTION(is_a);
+@@ -101,6 +104,9 @@
+ 	ZEND_FE(crash,				NULL)
+ #endif
+ #endif
++#if HARDENED_PHP_MM_PROTECT_DEBUG
++	ZEND_FE(heap_overflow,			NULL)
++#endif
+ 	ZEND_FE(get_included_files,	NULL)
+ 	ZEND_FALIAS(get_required_files,	get_included_files,		NULL)
+ 	ZEND_FE(is_subclass_of,		NULL)
+@@ -804,6 +810,19 @@
+ #endif
+ 
+ #endif /* ZEND_DEBUG */
++
++
++#if HARDENED_PHP_MM_PROTECT_DEBUG
++ZEND_FUNCTION(heap_overflow)
++{
++	char *nowhere = emalloc(10);
++
++	memcpy(nowhere, "something1234567890", sizeof("something1234567890"));
++	
++	efree(nowhere);
++}
++#endif
++
+ 
+ /* {{{ proto array get_included_files(void)
+    Returns an array with the file names that were include_once()'d */
+diff -Nur php-4.3.6.orig/Zend/zend_canary.c hardened-php/Zend/zend_canary.c
+--- php-4.3.6.orig/Zend/zend_canary.c	Thu Jan  1 01:00:00 1970
++++ hardened-php/Zend/zend_canary.c	Sun May 16 00:33:40 2004
+@@ -0,0 +1,58 @@
++/*
++   +----------------------------------------------------------------------+
++   | Hardened-PHP                                                         |
++   +----------------------------------------------------------------------+
++   | Copyright (c) 2004 Stefan Esser                                      |
++   +----------------------------------------------------------------------+
++   | This source file is subject to version 2.02 of the PHP license,      |
++   | that is bundled with this package in the file LICENSE, and is        |
++   | available at through the world-wide-web at                           |
++   | http://www.php.net/license/2_02.txt.                                 |
++   | If you did not receive a copy of the PHP license and are unable to   |
++   | obtain it through the world-wide-web, please send a note to          |
++   | license@php.net so we can mail you a copy immediately.               |
++   +----------------------------------------------------------------------+
++   | Author: Stefan Esser <sesser@php.net>                        |
++   +----------------------------------------------------------------------+
++ */
++/* $Id: hardened_php.c,v 1.51.2.4 2003/03/17 13:50:23 wez Exp $ */
++
++#include "zend.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++
++#if HARDENED_PHP_MM_PROTECT || HARDENED_PHP_LL_PROTECT
++
++/* will be replaced later with more compatible method */
++ZEND_API unsigned int zend_canary()
++{
++	time_t t;
++	unsigned int canary;
++	int fd;
++	
++	fd = open("/dev/urandom", 0);
++	if (fd != -1) {
++		int r = read(fd, &canary, sizeof(canary));
++		close(fd);
++		if (r == sizeof(canary)) {
++			return (canary);
++		}
++	}
++	/* not good but we never want to do this */
++	time(&t);
++	canary = *(unsigned int *)&t + getpid() << 16;
++	return (canary);
++}
++#endif
++
++
++/*
++ * Local variables:
++ * tab-width: 4
++ * c-basic-offset: 4
++ * End:
++ * vim600: sw=4 ts=4 fdm=marker
++ * vim<600: sw=4 ts=4
++ */
+diff -Nur php-4.3.6.orig/Zend/zend_execute.c hardened-php/Zend/zend_execute.c
+--- php-4.3.6.orig/Zend/zend_execute.c	Fri Apr 16 19:25:37 2004
++++ hardened-php/Zend/zend_execute.c	Sun May 16 00:33:40 2004
+@@ -2137,7 +2137,12 @@
+ 								int dummy = 1;
+ 								zend_file_handle file_handle = {0};
+ 
++#if HARDENED_PHP_INC_PROTECT
++								if (zend_is_valid_include(inc_filename) 
++										&& zend_open(inc_filename->value.str.val, &file_handle) == SUCCESS
++#else
+ 								if (zend_open(inc_filename->value.str.val, &file_handle) == SUCCESS
++#endif
+ 										&& ZEND_IS_VALID_FILE_HANDLE(&file_handle)) {
+ 
+ 									file_handle.filename = inc_filename->value.str.val;
+@@ -2166,6 +2171,11 @@
+ 							break;
+ 						case ZEND_INCLUDE:
+ 						case ZEND_REQUIRE:
++#if HARDENED_PHP_INC_PROTECT
++							if (!zend_is_valid_include(inc_filename)) {
++								break;
++							}
++#endif
+ 							new_op_array = compile_filename(EX(opline)->op2.u.constant.value.lval, inc_filename TSRMLS_CC);
+ 							break;
+ 						case ZEND_EVAL: {
+diff -Nur php-4.3.6.orig/Zend/zend_globals.h hardened-php/Zend/zend_globals.h
+--- php-4.3.6.orig/Zend/zend_globals.h	Fri Apr 16 19:25:37 2004
++++ hardened-php/Zend/zend_globals.h	Sun May 16 00:33:40 2004
+@@ -229,6 +229,14 @@
+ 	int cache_stats[MAX_CACHED_MEMORY][2];
+ 	int fast_cache_stats[MAX_FAST_CACHE_TYPES][2];
+ #endif
++#if HARDENED_PHP_MM_PROTECT
++	unsigned int canary_1;
++	unsigned int canary_2;
++#endif
++#if HARDENED_PHP_LL_PROTECT
++	unsigned int canary_3;
++	unsigned int canary_4;
++#endif
+ #if MEMORY_LIMIT
+ 	unsigned int memory_limit;
+ 	unsigned int allocated_memory;
+diff -Nur php-4.3.6.orig/Zend/zend_hash.c hardened-php/Zend/zend_hash.c
+--- php-4.3.6.orig/Zend/zend_hash.c	Fri Apr 16 19:25:37 2004
++++ hardened-php/Zend/zend_hash.c	Sun May 16 00:33:40 2004
+@@ -447,7 +447,7 @@
+ 	IS_CONSISTENT(ht);
+ 
+ 	if ((ht->nTableSize << 1) > 0) {	/* Let's double the table size */
+-		t = (Bucket **) perealloc_recoverable(ht->arBuckets, (ht->nTableSize << 1) * sizeof(Bucket *), ht->persistent);
++		t = (Bucket **) perealloc(ht->arBuckets, (ht->nTableSize << 1) * sizeof(Bucket *), ht->persistent);
+ 		if (t) {
+ 			HANDLE_BLOCK_INTERRUPTIONS();
+ 			ht->arBuckets = t;
+@@ -457,6 +457,7 @@
+ 			HANDLE_UNBLOCK_INTERRUPTIONS();
+ 			return SUCCESS;
+ 		}
++		zend_error(E_ERROR, "zend_hash_do_resize - out of memory");
+ 		return FAILURE;
+ 	}
+ 	return SUCCESS;
+diff -Nur php-4.3.6.orig/Zend/zend_llist.c hardened-php/Zend/zend_llist.c
+--- php-4.3.6.orig/Zend/zend_llist.c	Fri Apr 16 19:25:37 2004
++++ hardened-php/Zend/zend_llist.c	Sun May 16 00:33:40 2004
+@@ -21,9 +21,34 @@
+ #include "zend.h"
+ #include "zend_llist.h"
+ #include "zend_qsort.h"
++#include "zend_globals.h"
++
++#define CHECK_LIST_CANARY(list) \
++	if (AG(canary_3) != (list)->canary_h || AG(canary_4) != (list)->canary_t) { \
++		zend_security_log("linked list canary was overwritten"); \
++		exit(1); \
++	}
++
++#define CHECK_LISTELEMENT_CANARY(elem) \
++	if (AG(canary_3) != (elem)->canary) { \
++		zend_security_log("linked list element canary was overwritten"); \
++		exit(1); \
++	}
++
+ 
+ ZEND_API void zend_llist_init(zend_llist *l, size_t size, llist_dtor_func_t dtor, unsigned char persistent)
+ {
++#if HARDENED_PHP_LL_PROTECT
++	static int ll_canary_inited = 0;
++	
++	if (!ll_canary_inited) {
++		AG(canary_3) = zend_canary();
++		AG(canary_4) = zend_canary();
++		ll_canary_inited = 1;
++	}
++	l->canary_h = AG(canary_3);
++	l->canary_t = AG(canary_4);
++#endif
+ 	l->head  = NULL;
+ 	l->tail  = NULL;
+ 	l->count = 0;
+@@ -37,6 +62,10 @@
+ {
+ 	zend_llist_element *tmp = pemalloc(sizeof(zend_llist_element)+l->size-1, l->persistent);
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++	tmp->canary = AG(canary_3);
++#endif
+ 	tmp->prev = l->tail;
+ 	tmp->next = NULL;
+ 	if (l->tail) {
+@@ -55,6 +84,10 @@
+ {
+ 	zend_llist_element *tmp = pemalloc(sizeof(zend_llist_element)+l->size-1, l->persistent);
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++	tmp->canary = AG(canary_3);
++#endif
+ 	tmp->next = l->head;
+ 	tmp->prev = NULL;
+ 	if (l->head) {
+@@ -91,10 +124,19 @@
+ 	zend_llist_element *current=l->head;
+ 	zend_llist_element *next;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	while (current) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(current)
++#endif
+ 		next = current->next;
+ 		if (compare(current->data, element)) {
+ 			DEL_LLIST_ELEMENT(current, l);
++#if HARDENED_PHP_LL_PROTECT
++			current->canary = 0;
++#endif
+ 			break;
+ 		}
+ 		current = next;
+@@ -106,7 +148,13 @@
+ {
+ 	zend_llist_element *current=l->head, *next;
+ 	
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	while (current) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(current)
++#endif
+ 		next = current->next;
+ 		if (l->dtor) {
+ 			l->dtor(current->data);
+@@ -131,7 +179,13 @@
+ 	zend_llist_element *old_tail;
+ 	void *data;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	if ((old_tail = l->tail)) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(old_tail)
++#endif
+ 		if (l->tail->prev) {
+ 			l->tail->prev->next = NULL;
+ 		}
+@@ -157,9 +211,15 @@
+ {
+ 	zend_llist_element *ptr;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(src)
++#endif
+ 	zend_llist_init(dst, src->size, src->dtor, src->persistent);
+ 	ptr = src->head;
+ 	while (ptr) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(ptr)
++#endif
+ 		zend_llist_add_element(dst, ptr->data);
+ 		ptr = ptr->next;
+ 	}
+@@ -170,11 +230,20 @@
+ {
+ 	zend_llist_element *element, *next;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	element=l->head;
+ 	while (element) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(element)
++#endif
+ 		next = element->next;
+ 		if (func(element->data)) {
+ 			DEL_LLIST_ELEMENT(element, l);
++#if HARDENED_PHP_LL_PROTECT
++			element->canary = 0;
++#endif
+ 		}
+ 		element = next;
+ 	}
+@@ -185,7 +254,13 @@
+ {
+ 	zend_llist_element *element;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	for (element=l->head; element; element=element->next) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(element)
++#endif
+ 		func(element->data TSRMLS_CC);
+ 	}
+ }
+@@ -197,6 +272,9 @@
+ 	zend_llist_element **elements;
+ 	zend_llist_element *element, **ptr;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	if (l->count <= 0) {
+ 		return;
+ 	}
+@@ -206,6 +284,9 @@
+ 	ptr = &elements[0];
+ 
+ 	for (element=l->head; element; element=element->next) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(element)
++#endif
+ 		*ptr++ = element;
+ 	}
+ 
+@@ -228,7 +309,13 @@
+ {
+ 	zend_llist_element *element;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	for (element=l->head; element; element=element->next) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(element)
++#endif
+ 		func(element->data, arg TSRMLS_CC);
+ 	}
+ }
+@@ -239,8 +326,14 @@
+ 	zend_llist_element *element;
+ 	va_list args;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	va_start(args, num_args);
+ 	for (element=l->head; element; element=element->next) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(element)
++#endif
+ 		func(element->data, num_args, args TSRMLS_CC);
+ 	}
+ 	va_end(args);
+@@ -249,6 +342,9 @@
+ 
+ ZEND_API int zend_llist_count(zend_llist *l)
+ {
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	return l->count;
+ }
+     
+@@ -256,8 +352,14 @@
+ {
+ 	zend_llist_position *current = pos ? pos : &l->traverse_ptr;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	*current = l->head;
+ 	if (*current) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(*current)
++#endif
+ 		return (*current)->data;
+ 	} else {
+ 		return NULL;
+@@ -269,8 +371,14 @@
+ {
+ 	zend_llist_position *current = pos ? pos : &l->traverse_ptr;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	*current = l->tail;
+ 	if (*current) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(*current)
++#endif
+ 		return (*current)->data;
+ 	} else {
+ 		return NULL;
+@@ -282,9 +390,18 @@
+ {
+ 	zend_llist_position *current = pos ? pos : &l->traverse_ptr;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	if (*current) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(*current)
++#endif
+ 		*current = (*current)->next;
+ 		if (*current) {
++#if HARDENED_PHP_LL_PROTECT
++			CHECK_LISTELEMENT_CANARY(*current)
++#endif
+ 			return (*current)->data;
+ 		}
+ 	}
+@@ -296,9 +413,18 @@
+ {
+ 	zend_llist_position *current = pos ? pos : &l->traverse_ptr;
+ 
++#if HARDENED_PHP_LL_PROTECT
++	CHECK_LIST_CANARY(l)
++#endif
+ 	if (*current) {
++#if HARDENED_PHP_LL_PROTECT
++		CHECK_LISTELEMENT_CANARY(*current)
++#endif
+ 		*current = (*current)->prev;
+ 		if (*current) {
++#if HARDENED_PHP_LL_PROTECT
++			CHECK_LISTELEMENT_CANARY(*current)
++#endif
+ 			return (*current)->data;
+ 		}
+ 	}
+diff -Nur php-4.3.6.orig/Zend/zend_llist.h hardened-php/Zend/zend_llist.h
+--- php-4.3.6.orig/Zend/zend_llist.h	Fri Apr 16 19:25:37 2004
++++ hardened-php/Zend/zend_llist.h	Sun May 16 00:33:40 2004
+@@ -24,6 +24,9 @@
+ #include <stdlib.h>
+ 
+ typedef struct _zend_llist_element {
++#if HARDENED_PHP_LL_PROTECT
++	unsigned int canary;
++#endif	
+ 	struct _zend_llist_element *next;
+ 	struct _zend_llist_element *prev;
+ 	char data[1]; /* Needs to always be last in the struct */
+@@ -36,6 +39,9 @@
+ typedef void (*llist_apply_func_t)(void * TSRMLS_DC);
+ 
+ typedef struct _zend_llist {
++#if HARDENED_PHP_LL_PROTECT
++	unsigned int canary_h; /* head */
++#endif	
+ 	zend_llist_element *head;
+ 	zend_llist_element *tail;
+ 	size_t size;
+@@ -43,6 +49,9 @@
+ 	llist_dtor_func_t dtor;
+ 	unsigned char persistent;
+ 	zend_llist_element *traverse_ptr;
++#if HARDENED_PHP_LL_PROTECT
++	unsigned int canary_t; /* tail */
++#endif	
+ } zend_llist;
+ 
+ typedef zend_llist_element* zend_llist_position;
+diff -Nur php-4.3.6.orig/configure hardened-php/configure
+--- php-4.3.6.orig/configure	Fri Apr 16 19:25:50 2004
++++ hardened-php/configure	Sun May 16 00:33:40 2004
+@@ -389,6 +389,14 @@
+ ac_default_prefix=/usr/local
+ # Any additions from configure.in:
+ ac_help="$ac_help
++  --disable-hardened-php-mm-protect    Disable the Memory Manager protection."
++ac_help="$ac_help
++  --disable-hardened-php-ll-protect    Disable the Linked List protection."
++ac_help="$ac_help
++  --disable-hardened-php-inc-protect   Disable include/require protection."
++ac_help="$ac_help
++  --disable-hardened-php-fmt-protect   Disable format string protection."
++ac_help="$ac_help
+ 
+ SAPI modules:
+ "
+@@ -2643,6 +2651,128 @@
+ 
+ 
+ 
++# Check whether --enable-hardened-php-mm-protect or --disable-hardened-php-mm-protect was given.
++if test "${enable_hardened_php_mm_protect+set}" = set; then
++  enableval="$enable_hardened_php_mm_protect"
++  
++  DO_HARDENED_PHP_MM_PROTECT=$enableval
++
++else
++  
++  DO_HARDENED_PHP_MM_PROTECT=yes
++
++fi
++
++
++# Check whether --enable-hardened-php-ll-protect or --disable-hardened-php-ll-protect was given.
++if test "${enable_hardened_php_ll_protect+set}" = set; then
++  enableval="$enable_hardened_php_ll_protect"
++  
++  DO_HARDENED_PHP_LL_PROTECT=$enableval
++
++else
++  
++  DO_HARDENED_PHP_LL_PROTECT=yes
++
++fi
++
++
++# Check whether --enable-hardened-php-inc-protect or --disable-hardened-php-inc-protect was given.
++if test "${enable_hardened_php_inc_protect+set}" = set; then
++  enableval="$enable_hardened_php_inc_protect"
++  
++  DO_HARDENED_PHP_INC_PROTECT=$enableval
++
++else
++  
++  DO_HARDENED_PHP_INC_PROTECT=yes
++
++fi
++
++
++# Check whether --enable-hardened-php-fmt-protect or --disable-hardened-php-fmt-protect was given.
++if test "${enable_hardened_php_fmt_protect+set}" = set; then
++  enableval="$enable_hardened_php_fmt_protect"
++  
++  DO_HARDENED_PHP_FMT_PROTECT=$enableval
++
++else
++  
++  DO_HARDENED_PHP_FMT_PROTECT=yes
++
++fi
++
++
++echo $ac_n "checking whether to protect the Zend Memory Manager""... $ac_c" 1>&6
++echo "configure:2725: checking whether to protect the Zend Memory Manager" >&5
++echo "$ac_t""$DO_HARDENED_PHP_MM_PROTECT" 1>&6
++
++echo $ac_n "checking whether to protect the Zend Linked Lists""... $ac_c" 1>&6
++echo "configure:2729: checking whether to protect the Zend Linked Lists" >&5
++echo "$ac_t""$DO_HARDENED_PHP_LL_PROTECT" 1>&6
++
++echo $ac_n "checking whether to protect include/require statements""... $ac_c" 1>&6
++echo "configure:2733: checking whether to protect include/require statements" >&5
++echo "$ac_t""$DO_HARDENED_PHP_INC_PROTECT" 1>&6
++
++echo $ac_n "checking whether to protect PHP Format String functions""... $ac_c" 1>&6
++echo "configure:2737: checking whether to protect PHP Format String functions" >&5
++echo "$ac_t""$DO_HARDENED_PHP_FMT_PROTECT" 1>&6
++
++
++cat >> confdefs.h <<\EOF
++#define HARDENED_PHP 1
++EOF
++
++
++
++if test "$DO_HARDENED_PHP_MM_PROTECT" = "yes"; then
++  cat >> confdefs.h <<\EOF
++#define HARDENED_PHP_MM_PROTECT 1
++EOF
++
++else
++  cat >> confdefs.h <<\EOF
++#define HARDENED_PHP_MM_PROTECT 0
++EOF
++
++fi
++
++if test "$DO_HARDENED_PHP_LL_PROTECT" = "yes"; then
++  cat >> confdefs.h <<\EOF
++#define HARDENED_PHP_LL_PROTECT 1
++EOF
++
++else
++  cat >> confdefs.h <<\EOF
++#define HARDENED_PHP_LL_PROTECT 0
++EOF
++
++fi
++
++if test "$DO_HARDENED_PHP_INC_PROTECT" = "yes"; then
++  cat >> confdefs.h <<\EOF
++#define HARDENED_PHP_INC_PROTECT 1
++EOF
++
++else
++  cat >> confdefs.h <<\EOF
++#define HARDENED_PHP_INC_PROTECT 0
++EOF
++
++fi
++
++if test "$DO_HARDENED_PHP_FMT_PROTECT" = "yes"; then
++  cat >> confdefs.h <<\EOF
++#define HARDENED_PHP_FMT_PROTECT 1
++EOF
++
++else
++  cat >> confdefs.h <<\EOF
++#define HARDENED_PHP_FMT_PROTECT 0
++EOF
++
++fi
+ 
+ 
+ 
+@@ -94186,7 +94316,7 @@
+        php_ini.c SAPI.c rfc1867.c php_content_types.c strlcpy.c \
+        strlcat.c mergesort.c reentrancy.c php_variables.c php_ticks.c \
+        streams.c network.c php_open_temporary_file.c php_logos.c \
+-       output.c memory_streams.c user_streams.c; do
++       output.c memory_streams.c user_streams.c hardened_php.c; do
+   
+       IFS=.
+       set $ac_src
+@@ -94359,7 +94489,7 @@
+     zend_opcode.c zend_operators.c zend_ptr_stack.c zend_stack.c \
+     zend_variables.c zend.c zend_API.c zend_extensions.c zend_hash.c \
+     zend_list.c zend_indent.c zend_builtin_functions.c zend_sprintf.c \
+-    zend_ini.c zend_qsort.c zend_multibyte.c; do
++    zend_ini.c zend_qsort.c zend_multibyte.c zend_canary.c; do
+   
+       IFS=.
+       set $ac_src
+diff -Nur php-4.3.6.orig/configure.in hardened-php/configure.in
+--- php-4.3.6.orig/configure.in	Fri Apr 16 19:25:50 2004
++++ hardened-php/configure.in	Sun May 16 00:33:40 2004
+@@ -205,7 +205,7 @@
+ sinclude(Zend/acinclude.m4)
+ sinclude(Zend/Zend.m4)
+ sinclude(TSRM/tsrm.m4)
+-
++sinclude(main/hardened_php.m4)
+ 
+ 
+ divert(2)
+@@ -1197,7 +1197,7 @@
+        php_ini.c SAPI.c rfc1867.c php_content_types.c strlcpy.c \
+        strlcat.c mergesort.c reentrancy.c php_variables.c php_ticks.c \
+        streams.c network.c php_open_temporary_file.c php_logos.c \
+-       output.c memory_streams.c user_streams.c)
++       output.c memory_streams.c user_streams.c hardened_php.c)
+ PHP_ADD_SOURCES(/main, internal_functions.c,, sapi)
+ PHP_ADD_SOURCES(/main, internal_functions_cli.c,, cli)
+ 
+@@ -1210,7 +1210,7 @@
+     zend_opcode.c zend_operators.c zend_ptr_stack.c zend_stack.c \
+     zend_variables.c zend.c zend_API.c zend_extensions.c zend_hash.c \
+     zend_list.c zend_indent.c zend_builtin_functions.c zend_sprintf.c \
+-    zend_ini.c zend_qsort.c zend_multibyte.c)
++    zend_ini.c zend_qsort.c zend_multibyte.c zend_canary.c)
+ 
+ if test -r "$abs_srcdir/Zend/zend_objects.c"; then
+   PHP_ADD_SOURCES(Zend, zend_objects.c zend_object_handlers.c zend_objects_API.c zend_mm.c)
+diff -Nur php-4.3.6.orig/main/SAPI.h hardened-php/main/SAPI.h
+--- php-4.3.6.orig/main/SAPI.h	Fri Apr 16 19:25:39 2004
++++ hardened-php/main/SAPI.h	Sun May 16 00:33:40 2004
+@@ -101,9 +101,14 @@
+ 	char *current_user;
+ 	int current_user_length;
+ 
+-    /* this is necessary for CLI module */
+-    int argc;
+-    char **argv;
++	/* this is necessary for CLI module */
++	int argc;
++	char **argv;
++	
++#if HARDENED_PHP
++	/* this is necessary for IP logging */
++	char ip_address[64];
++#endif
+ } sapi_request_info;
+ 
+ 
+diff -Nur php-4.3.6.orig/main/hardened_php.c hardened-php/main/hardened_php.c
+--- php-4.3.6.orig/main/hardened_php.c	Thu Jan  1 01:00:00 1970
++++ hardened-php/main/hardened_php.c	Sun May 16 00:38:41 2004
+@@ -0,0 +1,160 @@
++/*
++   +----------------------------------------------------------------------+
++   | PHP Version 4                                                        |
++   +----------------------------------------------------------------------+
++   | Copyright (c) 1997-2003 The PHP Group                                |
++   +----------------------------------------------------------------------+
++   | This source file is subject to version 2.02 of the PHP license,      |
++   | that is bundled with this package in the file LICENSE, and is        |
++   | available at through the world-wide-web at                           |
++   | http://www.php.net/license/2_02.txt.                                 |
++   | If you did not receive a copy of the PHP license and are unable to   |
++   | obtain it through the world-wide-web, please send a note to          |
++   | license@php.net so we can mail you a copy immediately.               |
++   +----------------------------------------------------------------------+
++   | Author: Stefan Esser <sesser@php.net>                        |
++   +----------------------------------------------------------------------+
++ */
++/* $Id: hardened_php.c,v 1.51.2.4 2003/03/17 13:50:23 wez Exp $ */
++
++#include "php.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#if HAVE_UNISTD_H
++#include <unistd.h>
++#endif
++#include "SAPI.h"
++#include "php_globals.h"
++
++#if HARDENED_PHP
++
++#ifdef HAVE_SYS_SOCKET_H
++#include <sys/socket.h>
++#endif
++
++#if defined(PHP_WIN32) || defined(__riscos__) || defined(NETWARE)
++#undef AF_UNIX
++#endif
++
++#if defined(AF_UNIX)
++#include <sys/un.h>
++#endif
++
++#define SYSLOG_PATH  "/dev/log"
++
++#include "snprintf.h"
++
++PHPAPI void php_security_log(char *str)
++{
++#if defined(AF_UNIX)
++	int s, r;
++	struct sockaddr_un sun;
++	char buf[1024];
++	
++	ap_php_snprintf(buf, 1024, "php security-alert: %s (attacker '%s')\n", str, SG(request_info).ip_address);
++	
++	s = socket(AF_UNIX, SOCK_DGRAM, 0);
++	if (s == -1) {
++		return;
++	}
++	
++	memset(&sun, 0, sizeof(sun));
++	sun.sun_family = AF_UNIX;
++	strcpy(sun.sun_path, SYSLOG_PATH);
++	/*sun.sun_len = sizeof(sun);*/
++	
++	r = connect(s, (struct sockaddr *)&sun, sizeof(sun));
++	if (r) {
++		close(s);
++		return;
++	}
++	send(s, buf, strlen(buf), 0);
++	
++	close(s);
++#endif
++}
++#endif
++
++#if HARDENED_PHP_MM_PROTECT || HARDENED_PHP_LL_PROTECT
++
++/* will be replaced later with more compatible method */
++PHPAPI unsigned int php_canary()
++{
++	time_t t;
++	unsigned int canary;
++	int fd;
++	
++	fd = open("/dev/urandom", 0);
++	if (fd != -1) {
++		int r = read(fd, &canary, sizeof(canary));
++		close(fd);
++		if (r == sizeof(canary)) {
++			return (canary);
++		}
++	}
++	/* not good but we never want to do this */
++	time(&t);
++	canary = *(unsigned int *)&t + getpid() << 16;
++	return (canary);
++}
++#endif
++
++#if HARDENED_PHP_INC_PROTECT
++
++PHPAPI int php_is_valid_include(zval *z)
++{
++	char *filename;
++	int len;
++	TSRMLS_FETCH();
++	
++	/* must be of type string */
++	if (z->type != IS_STRING || z->value.str.val == NULL) {
++		return (0);
++	}
++	
++	/* short cut */
++	filename = z->value.str.val;
++	len = z->value.str.len;
++	
++	/* 1. must be shorter than MAXPATHLEN */
++	if (len > MAXPATHLEN) {
++		php_security_log("Include filename longer than MAXPATHLEN chars");
++		return (0);
++	}
++	
++	/* 2. must not be cutted */
++	if (len != strlen(filename)) {
++		php_security_log("Include filename has a \\0 cut");
++		return (0);
++	}
++	
++	/* 3. must not be a URL */
++	if (strstr(filename, "://")) {
++		php_security_log("Include filename is an URL");
++		return (0);
++	}
++	
++	/* 4. must not be an uploaded file */
++	if (SG(rfc1867_uploaded_files)) {
++		if (zend_hash_exists(SG(rfc1867_uploaded_files), (char *) filename, len+1)) {
++			php_security_log("Include filename is an uploaded file");
++			return (0);
++		}
++	}
++	
++	/* passed all tests */
++	return (1);
++}
++
++#endif
++
++/*
++ * Local variables:
++ * tab-width: 4
++ * c-basic-offset: 4
++ * End:
++ * vim600: sw=4 ts=4 fdm=marker
++ * vim<600: sw=4 ts=4
++ */
+diff -Nur php-4.3.6.orig/main/hardened_php.h hardened-php/main/hardened_php.h
+--- php-4.3.6.orig/main/hardened_php.h	Thu Jan  1 01:00:00 1970
++++ hardened-php/main/hardened_php.h	Sun May 16 00:33:40 2004
+@@ -0,0 +1,44 @@
++/*
++   +----------------------------------------------------------------------+
++   | PHP Version 4                                                        |
++   +----------------------------------------------------------------------+
++   | Copyright (c) 1997-2003 The PHP Group                                |
++   +----------------------------------------------------------------------+
++   | This source file is subject to version 2.02 of the PHP license,      |
++   | that is bundled with this package in the file LICENSE, and is        |
++   | available at through the world-wide-web at                           |
++   | http://www.php.net/license/2_02.txt.                                 |
++   | If you did not receive a copy of the PHP license and are unable to   |
++   | obtain it through the world-wide-web, please send a note to          |
++   | license@php.net so we can mail you a copy immediately.               |
++   +----------------------------------------------------------------------+
++   | Author:  Stefan Esser <sesser@php.net>                                |
++   +----------------------------------------------------------------------+
++*/
++
++
++#ifndef HARDENED_PHP_H
++#define HARDENED_PHP_H
++
++#include "zend.h"
++
++#if HARDENED_PHP
++PHPAPI void php_security_log(char *str);
++#endif
++
++#if HARDENED_PHP_MM_PROTECT || HARDENED_PHP_LL_PROTECT
++PHPAPI unsigned int php_canary();
++#endif
++
++#if HARDENED_PHP_INC_PROTECT
++PHPAPI int php_is_valid_include(zval *z);
++#endif
++
++#endif /* HARDENED_PHP_H */
++
++/*
++ * Local variables:
++ * tab-width: 4
++ * c-basic-offset: 4
++ * End:
++ */
+diff -Nur php-4.3.6.orig/main/hardened_php.m4 hardened-php/main/hardened_php.m4
+--- php-4.3.6.orig/main/hardened_php.m4	Thu Jan  1 01:00:00 1970
++++ hardened-php/main/hardened_php.m4	Sun May 16 00:33:40 2004
+@@ -0,0 +1,78 @@
++dnl
++dnl $Id: hardened_php.m4 Exp $
++dnl
++dnl This file contains Hardened-PHP specific autoconf functions.
++dnl
++
++AC_ARG_ENABLE(hardened-php-mm-protect,
++[  --disable-hardened-php-mm-protect    Disable the Memory Manager protection.],[
++  DO_HARDENED_PHP_MM_PROTECT=$enableval
++],[
++  DO_HARDENED_PHP_MM_PROTECT=yes
++])
++
++AC_ARG_ENABLE(hardened-php-ll-protect,
++[  --disable-hardened-php-ll-protect    Disable the Linked List protection.],[
++  DO_HARDENED_PHP_LL_PROTECT=$enableval
++],[
++  DO_HARDENED_PHP_LL_PROTECT=yes
++])
++
++AC_ARG_ENABLE(hardened-php-inc-protect,
++[  --disable-hardened-php-inc-protect   Disable include/require protection.],[
++  DO_HARDENED_PHP_INC_PROTECT=$enableval
++],[
++  DO_HARDENED_PHP_INC_PROTECT=yes
++])
++
++AC_ARG_ENABLE(hardened-php-fmt-protect,
++[  --disable-hardened-php-fmt-protect   Disable format string protection.],[
++  DO_HARDENED_PHP_FMT_PROTECT=$enableval
++],[
++  DO_HARDENED_PHP_FMT_PROTECT=yes
++])
++
++AC_MSG_CHECKING(whether to protect the Zend Memory Manager)
++AC_MSG_RESULT($DO_HARDENED_PHP_MM_PROTECT)
++
++AC_MSG_CHECKING(whether to protect the Zend Linked Lists)
++AC_MSG_RESULT($DO_HARDENED_PHP_LL_PROTECT)
++
++AC_MSG_CHECKING(whether to protect include/require statements)
++AC_MSG_RESULT($DO_HARDENED_PHP_INC_PROTECT)
++
++AC_MSG_CHECKING(whether to protect PHP Format String functions)
++AC_MSG_RESULT($DO_HARDENED_PHP_FMT_PROTECT)
++
++
++AC_DEFINE(HARDENED_PHP, 1, [Hardened-PHP])
++
++
++if test "$DO_HARDENED_PHP_MM_PROTECT" = "yes"; then
++dnl  AC_DEFINE(HARDENED_PHP, 1, [Hardened-PHP])
++  AC_DEFINE(HARDENED_PHP_MM_PROTECT, 1, [Memory Manager Protection])
++else
++  AC_DEFINE(HARDENED_PHP_MM_PROTECT, 0, [Memory Manager Protection])
++fi
++
++if test "$DO_HARDENED_PHP_LL_PROTECT" = "yes"; then
++dnl    AC_DEFINE(HARDENED_PHP, 1, [Hardened-PHP])
++  AC_DEFINE(HARDENED_PHP_LL_PROTECT, 1, [Linked List Protection])
++else
++  AC_DEFINE(HARDENED_PHP_LL_PROTECT, 0, [Linked List Protection])
++fi
++
++if test "$DO_HARDENED_PHP_INC_PROTECT" = "yes"; then
++dnl    AC_DEFINE(HARDENED_PHP, 1, [Hardened-PHP])
++  AC_DEFINE(HARDENED_PHP_INC_PROTECT, 1, [Include/Require Protection])
++else
++  AC_DEFINE(HARDENED_PHP_INC_PROTECT, 0, [Include/Require Protection])
++fi
++
++if test "$DO_HARDENED_PHP_FMT_PROTECT" = "yes"; then
++dnl    AC_DEFINE(HARDENED_PHP, 1, [Hardened-PHP])
++  AC_DEFINE(HARDENED_PHP_FMT_PROTECT, 1, [Fmt String Protection])
++else
++  AC_DEFINE(HARDENED_PHP_FMT_PROTECT, 0, [Fmt String Protection])
++fi
++
+diff -Nur php-4.3.6.orig/main/main.c hardened-php/main/main.c
+--- php-4.3.6.orig/main/main.c	Fri Apr 16 19:25:39 2004
++++ hardened-php/main/main.c	Sun May 16 00:33:40 2004
+@@ -1103,6 +1103,12 @@
+ 	php_output_startup();
+ 	php_output_activate(TSRMLS_C);
+ 
++#if HARDENED_PHP_INC_PROTECT
++	zuf.is_valid_include = php_is_valid_include;
++#endif
++#if HARDENED_PHP
++	zuf.security_log_function = php_security_log;
++#endif
+ 	zuf.error_function = php_error_cb;
+ 	zuf.printf_function = php_printf;
+ 	zuf.write_function = php_body_write_wrapper;
+@@ -1306,6 +1312,9 @@
+  */
+ static inline void php_register_server_variables(TSRMLS_D)
+ {
++#if HARDENED_PHP
++	zval **remote_addr;
++#endif
+ 	zval *array_ptr=NULL;
+ 
+ 	ALLOC_ZVAL(array_ptr);
+@@ -1317,6 +1326,14 @@
+ 	if (sapi_module.register_server_variables) {
+ 		sapi_module.register_server_variables(array_ptr TSRMLS_CC);
+ 	}
++
++#if HARDENED_PHP
++	if (zend_hash_find(array_ptr->value.ht, "REMOTE_ADDR", sizeof("REMOTE_ADDR"), (void **) &remote_addr)==SUCCESS) {
++		strncpy(SG(request_info).ip_address, Z_STRVAL_PP(remote_addr), sizeof(SG(request_info).ip_address)); 
++	} else {
++		strcpy(SG(request_info).ip_address, "REMOTE_ADDR not set");
++	}
++#endif
+ 
+ 	/* PHP Authentication support */
+ 	if (SG(request_info).auth_user) {
+diff -Nur php-4.3.6.orig/main/php.h hardened-php/main/php.h
+--- php-4.3.6.orig/main/php.h	Fri Apr 16 19:25:39 2004
++++ hardened-php/main/php.h	Sun May 16 00:33:40 2004
+@@ -35,6 +35,7 @@
+ #include "zend_qsort.h"
+ #include "php_compat.h"
+ 
++
+ #include "zend_API.h"
+ 
+ #if PHP_BROKEN_SPRINTF
+@@ -230,7 +231,7 @@
+ #define PHP_ATTRIBUTE_MALLOC ZEND_ATTRIBUTE_MALLOC
+ #define PHP_ATTRIBUTE_FORMAT ZEND_ATTRIBUTE_FORMAT
+ 
+-#if !defined(HAVE_SNPRINTF) || !defined(HAVE_VSNPRINTF) || PHP_BROKEN_SPRINTF || PHP_BROKEN_SNPRINTF || PHP_BROKEN_VSNPRINTF
++#if !defined(HAVE_SNPRINTF) || !defined(HAVE_VSNPRINTF) || PHP_BROKEN_SPRINTF || PHP_BROKEN_SNPRINTF || PHP_BROKEN_VSNPRINTF || HARDENED_PHP
+ #include "snprintf.h"
+ #endif
+ #include "spprintf.h"
+@@ -431,6 +432,10 @@
+ #define XtOffsetOf(s_type, field) XtOffset(s_type*, field)
+ #endif
+ #endif /* !XtOffsetOf */
++
++#if HARDENED_PHP
++#include "hardened_php.h"
++#endif
+ 
+ #endif
+ 
+diff -Nur php-4.3.6.orig/main/php_config.h.in hardened-php/main/php_config.h.in
+--- php-4.3.6.orig/main/php_config.h.in	Fri Apr 16 19:25:40 2004
++++ hardened-php/main/php_config.h.in	Sun May 16 00:33:40 2004
+@@ -831,6 +831,33 @@
+ /* Enabling BIND8 compatibility for Panther */
+ #undef BIND_8_COMPAT
+ 
++/* Hardened-PHP */
++#undef HARDENED_PHP
++
++/* Memory Manager Protection */
++#undef HARDENED_PHP_MM_PROTECT
++
++/* Memory Manager Protection */
++#undef HARDENED_PHP_MM_PROTECT
++
++/* Linked List Protection */
++#undef HARDENED_PHP_LL_PROTECT
++
++/* Linked List Protection */
++#undef HARDENED_PHP_LL_PROTECT
++
++/* Include/Require Protection */
++#undef HARDENED_PHP_INC_PROTECT
++
++/* Include/Require Protection */
++#undef HARDENED_PHP_INC_PROTECT
++
++/* Fmt String Protection */
++#undef HARDENED_PHP_FMT_PROTECT
++
++/* Fmt String Protection */
++#undef HARDENED_PHP_FMT_PROTECT
++
+ /* Whether you have AOLserver */
+ #undef HAVE_AOLSERVER
+ 
+diff -Nur php-4.3.6.orig/main/rfc1867.c hardened-php/main/rfc1867.c
+--- php-4.3.6.orig/main/rfc1867.c	Fri Apr 16 19:25:39 2004
++++ hardened-php/main/rfc1867.c	Sun May 16 00:42:55 2004
+@@ -147,7 +147,7 @@
+ 	
+ 	/* and remove it */
+ 	if (s != varname) {
+-		memcpy(varname, s, strlen(s)+1);
++		memmove(varname, s, strlen(s)+1);
+ 	}
+ 
+ 	for (p=varname; *p && *p != '['; p++) {
+@@ -178,7 +178,7 @@
+ 		indexend = indexend ? indexend + 1 : index + strlen(index);
+ 		
+ 		if (s != index) {
+-			memcpy(s, index, strlen(s)+1);
++			memmove(s, index, strlen(index)+1);
+ 			s += indexend-index;
+ 		} else {
+ 			s = indexend;
+diff -Nur php-4.3.6.orig/main/snprintf.c hardened-php/main/snprintf.c
+--- php-4.3.6.orig/main/snprintf.c	Fri Apr 16 19:25:40 2004
++++ hardened-php/main/snprintf.c	Sun May 16 00:33:40 2004
+@@ -462,7 +462,7 @@
+ 	return (buf);
+ }
+ 
+-#if !defined(HAVE_SNPRINTF) || !defined(HAVE_VSNPRINTF) || PHP_BROKEN_SNPRINTF || PHP_BROKEN_VSNPRINTF
++#if !defined(HAVE_SNPRINTF) || !defined(HAVE_VSNPRINTF) || PHP_BROKEN_SNPRINTF || PHP_BROKEN_VSNPRINTF || HARDENED_PHP
+ 
+ /*
+  * NUM_BUF_SIZE is the size of the buffer used for arithmetic conversions
+@@ -852,7 +852,11 @@
+ 
+ 
+ 				case 'n':
++#if HARDENED_PHP_FMT_PROTECT
++					php_security_log("'n' specifier within format string");
++#else
+ 					*(va_arg(ap, int *)) = cc;
++#endif
+ 					break;
+ 
+ 					/*
+diff -Nur php-4.3.6.orig/main/snprintf.h hardened-php/main/snprintf.h
+--- php-4.3.6.orig/main/snprintf.h	Fri Apr 16 19:25:40 2004
++++ hardened-php/main/snprintf.h	Sun May 16 00:33:40 2004
+@@ -62,12 +62,12 @@
+ #ifndef SNPRINTF_H
+ #define SNPRINTF_H
+ 
+-#if !defined(HAVE_SNPRINTF) || PHP_BROKEN_SNPRINTF
++#if !defined(HAVE_SNPRINTF) || PHP_BROKEN_SNPRINTF || HARDENED_PHP
+ int ap_php_snprintf(char *, size_t, const char *, ...) PHP_ATTRIBUTE_FORMAT(printf, 3, 4);
+ #define snprintf ap_php_snprintf
+ #endif
+ 
+-#if !defined(HAVE_VSNPRINTF) || PHP_BROKEN_VSNPRINTF
++#if !defined(HAVE_VSNPRINTF) || PHP_BROKEN_VSNPRINTF || HARDENED_PHP
+ int ap_php_vsnprintf(char *, size_t, const char *, va_list ap) PHP_ATTRIBUTE_FORMAT(printf, 3, 0);
+ #define vsnprintf ap_php_vsnprintf
+ #endif
+diff -Nur php-4.3.6.orig/main/spprintf.c hardened-php/main/spprintf.c
+--- php-4.3.6.orig/main/spprintf.c	Fri Apr 16 19:25:39 2004
++++ hardened-php/main/spprintf.c	Sun May 16 00:33:40 2004
+@@ -531,7 +531,11 @@
+ 
+ 
+ 				case 'n':
++#if HARDENED_PHP_FMT_PROTECT
++					php_security_log("'n' specifier within format string");
++#else
+ 					*(va_arg(ap, int *)) = cc;
++#endif
+ 					break;
+ 
+ 					/*
+diff -Nur php-4.3.6.orig/sapi/apache/mod_php4.c hardened-php/sapi/apache/mod_php4.c
+--- php-4.3.6.orig/sapi/apache/mod_php4.c	Fri Apr 16 19:25:44 2004
++++ hardened-php/sapi/apache/mod_php4.c	Sun May 16 00:33:40 2004
+@@ -891,7 +891,11 @@
+ 	{
+ 		TSRMLS_FETCH();
+ 		if (PG(expose_php)) {
++#if HARDENED_PHP
++			ap_add_version_component("Hardened-PHP/" PHP_VERSION);
++#else
+ 			ap_add_version_component("PHP/" PHP_VERSION);
++#endif			
+ 		}
+ 	}
+ #endif
+diff -Nur php-4.3.6.orig/sapi/apache2filter/sapi_apache2.c hardened-php/sapi/apache2filter/sapi_apache2.c
+--- php-4.3.6.orig/sapi/apache2filter/sapi_apache2.c	Fri Apr 16 19:25:45 2004
++++ hardened-php/sapi/apache2filter/sapi_apache2.c	Sun May 16 00:33:40 2004
+@@ -559,7 +559,11 @@
+ {
+ 	TSRMLS_FETCH();
+ 	if (PG(expose_php)) {
++#if HARDENED_PHP
++		ap_add_version_component(p, "Hardened-PHP/" PHP_VERSION);
++#else
+ 		ap_add_version_component(p, "PHP/" PHP_VERSION);
++#endif
+ 	}
+ }
+ 
+diff -Nur php-4.3.6.orig/sapi/apache2handler/sapi_apache2.c hardened-php/sapi/apache2handler/sapi_apache2.c
+--- php-4.3.6.orig/sapi/apache2handler/sapi_apache2.c	Fri Apr 16 19:25:45 2004
++++ hardened-php/sapi/apache2handler/sapi_apache2.c	Sun May 16 00:33:40 2004
+@@ -358,7 +358,11 @@
+ {
+ 	TSRMLS_FETCH();
+ 	if (PG(expose_php)) {
++#if HARDENED_PHP
++		ap_add_version_component(p, "Hardened-PHP/" PHP_VERSION);
++#else
+ 		ap_add_version_component(p, "PHP/" PHP_VERSION);
++#endif
+ 	}
+ }
+ 

