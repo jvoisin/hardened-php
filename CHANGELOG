@@ -1,0 +1,211 @@
+Hardening Patch 0.4.14
+
+    Added a critical fix for the patch against PHP 5.1.x - Remote URL Include Protection was not working. (only 5.1.x affected) Credits: Bart Vanbrabrant
+    Added more upstream security fixes for PHP 4/5
+    Added a fix for a Zend Engine memory corruption
+    Changed the way the memory_limit protection is implemented
+
+Hardening Patch 0.4.13
+
+    Added a hphp_strcasestr() function to work around a compilation problem on f.e. solaris systems
+
+Hardening Patch 0.4.12
+
+    Added a whole bunch of security fixes for PHP 4.4.2 and PHP 5.1.4 (some are not in upstream PHP)
+    Added a slight modification that improves the speed of the zend_hash canary protection
+    Added a feature to protect against various mail header attacks through mail() (newly introduced hphp.mail.protect directive)
+    Added a fix for a potential DOS vulnerability in the URL blacklist handling. Credits: Pavel Stano reported this bug
+
+Hardening Patch 0.4.11
+
+    Added a security fix for PHP 5.1’s realpath() cache
+    Bundle install-pear-nozlib.phar because it was missing in original PHP 5.1.4 tarball
+    Hotfix to realpath() to solve problems with non existing directories
+
+Hardening Patch 0.4.10
+
+    Fixed a compilation problem in PHP4 + ZTS mode
+    Finally fixed a trailing slash problem with open_baedir
+    Added a changelog file to the Hardening-Patch distribution to better keep up with changes
+
+Hardening Patch 0.4.9
+
+    Fixes a problem with trailing / in open_basedirs
+    Adds PHP‘s invalid characters in session identifier check
+    Adds security fixes from PHP (temporary file, zend_hash, phpinfo(), wordwrap(), htmlentities())
+
+Hardening Patch 0.4.8
+
+    Fixes an uninitialised variable in the HTTP Response Splitting Protection, that resulted in HTTP headers beeing not sent
+
+Hardening Patch 0.4.7
+
+    Fixes a problem with persistent Zend LList Canaries
+    Added a fix for a safe_mode bypass vulnerability in ext/curl
+
+Hardening Patch 0.4.6
+
+    Fixed some error situations in virtual_file_ex()
+    Added a dummy padding variable to work around a GCC bug
+    Changed Hardening-Patch’s module number
+    Moved HTTP Response Splitting Protection into the varfilter extension
+    Added protection of long superglobals against HTTP headers
+    Added session_id validation and creation hooks to the session extension
+    Backported delete old session flag from PHP 5.1 in session_regenerate_id()
+    Added session hooks to sqlite session handler
+
+Hardening Patch 0.4.5
+
+    Added fixes for ext/curl, ext/gd safe_mode/open_basedir bypass vulnerabilities
+    Addes an advertisement for http://www.hardened-php.net to phpinfo()
+    Changed that only the first forbidden variable is logged
+    Changed white- and blacklists to be persistent
+
+Hardening Patch 0.4.4
+
+    Changed the UPLOAD_ERR_FILTER numerical code
+    Disallow overwritting GLOBALS inside php_register_variable_ex()
+    Added a memory manager canary change between requests
+    Added more safe_mode/open_basedir checks to ext/curl, ext/gd
+    Added protection against ASCIIZ characters in user input
+    Backported some security fixes like register_globals reactivation through parse_str()
+    Backported a fix for memory_limit not beeing reset
+
+Hardening Patch 0.4.3
+
+    Added another hook for file uploads, that only checks the variablename. This also requires bumping the internal Hardening-Patch API number
+    Added black- and whitelist support for URL shemes in include filenames
+
+Hardening Patch 0.4.2
+
+    Added Solar Designer’s CRYPT_BLOWFISH implementation, to have CRYPT_BLOWFISH support in crypt() on all platforms
+    Added sha256() and sha256_file() functions that implement the successor of sha1
+    Update to XML_RPC 1.4.0 to eliminate eval() injection vulnerability
+
+Hardening Patch 0.4.1
+
+    register_tick_function, register_shutdown_function callbacks recognize being set from within eval()
+    functions and classes registered within eval() will automatically be handled as eval()’d code if the main script calls them (f.e. through callbacks)
+    WARNING: the eval() function black- and whitelist do NOT protect against eval()’d code manipulating the execution flow of the main script by changing the content of variables. (Variable access black- and whitelists are sheduled for a later version)
+
+Hardening Patch 0.4.0
+
+    Binary compatibility with older Hardening-Patch versions again broken to ensure compatibility with APC and similiar extensions.
+    PHP/Zend API numbers restored to PHP originals
+    Additional Hardening-Patch API numbers introduced
+    Fixed: Access to memory manager canaries could result in not aligned memory accesses
+    Fixed: Only use C style comments
+    New Feature: Introduced whitelists and blacklists for functions, like disable_functions but configurable on a per directory basis.
+    New Feature: Introduced separate whitelists and blacklists for functions that are called from within eval().
+
+Hardening Patch v0.3.2
+
+    Fixes a compilation error in ext/MySQLi
+    Fixes that without a verification script in place all fileuploads were forbidden
+
+Hardening Patch v0.3.1
+
+    Fixes a compilation error that exists in 0.3.0 (Thanks to Michal Lukaszek <prism@pld-linux.org >)
+    header() does not allow setting multiple HTTP headers at once
+    hphp.multiheader=On/Off controls this
+    Failed SQL Queries can now be logged in fbsql/mysql/mysqli/pgsql and sqlite
+    hphp.sql.bailout_on_error=On/Off allows termintating a script after failed queries
+
+Hardening Patch v0.3.0
+
+    Logging of ALERT classes can now be configured by class
+    Syslog facility and priority is now configurable
+    ALERTS can be logged by the SAPI error log
+    ALERTS can be logged by an external logging script
+    Attackers IP addresses can now be extracted from X-Forwarded-For headers
+    GET, POST, COOKIE variables with the following names are not registered:
+        GLOBALS, _COOKIE, _ENV, _FILES, _GET, _POST
+        _REQUEST, _SERVER, _SESSION, HTTP_COOKIE_VARS
+        HTTP_ENV_VARS, HTTP_GET_VARS, HTTP_POST_FILES,
+        HTTP_POST_VARS, HTTP_RAW_POST_DATA,
+        HTTP_SERVER_VARS, HTTP_SESSION_VARS
+    Following limits can be enforced on either COOKIE, GET and POST variables or on all REQUEST variables independent of origin
+        Number of variables
+        Maximum length of variable name [with and without indices]
+        Maximum length of array indices
+        Maximum length of variable value
+        Maximum depth of array
+    Number of uploadable files can be limited
+    Uploaded files can now be passed to an external verification script
+    Uploaded ELF files can be automatically filtered away
+    Execution Depth Limit
+    Failing SQL Queries within the MySQL extension can be logged
+    XML_RPC 1.3.1 replaces the vulnerable 1.2.2
+
+Hardening Patch v0.2.7
+
+    backport of fixes for vulnerabilities in PHP 4.3.10
+    fixes bug with open_basedir and mkdir with trailing slashes
+    adds safe unlink again, because canaries alone aren’t good enough
+    fixes non randomness of hash table canaries
+
+Hardening Patch v0.2.6
+
+    fixes compile problem on Solaris system
+    breaks binary compatibility to normal PHP by using some PHP5 structs in PHP4
+
+Hardening Patch v0.2.5
+
+    no new features
+    fixes compile problems on some platforms
+    fixes the new realpath() implementation with some symlinks
+
+Hardening Patch v0.2.4
+
+    backported fixes for CAN-2004-1018, CAN-2004-1019, CAN-2004-1020
+    and for CAN-2004-1063, CAN-2004-1064, CAN-2004-1065
+    adds protection of superglobals from extract()
+    replaces realpath() with an implementation based on FreeBSD’s realpath()
+    memory_limit cannot be raised over configured limit anymore
+
+Hardening Patch v0.2.3
+
+    fixes problem with logging the IP from varfilter extension
+    fixes logging under syslog-ng
+    adds protection of superglobals from import_request_variables()
+    fixes bug within addslashes within 4.3.9
+    adds logging of filename to php-security logs (does not work in all sapi yet)
+    increases maximum length of a variable to 10000 within varfilter
+    adds HARDENED_PHP and HARDENED_PHP_VERSION constants
+
+Hardening Patch v0.2.2 fixes
+
+    incompatibility between some configurations and HashTable Destructor protection
+
+Hardening Patch v0.2.1 fixes
+
+    compile problem with ext/mbstring
+    Basic Auth problem in PHP 5.0.0
+
+Hardening Patch v0.2.0 adds
+
+    all security fixes from PHP 4.3.8 for PHP 4.3.7 users
+    Canary protection of Zend HashTable destructors
+    Backport of PHP5’s input_filter technology
+    Hardening Patch’s varfilter extension
+
+Hardening Patch v0.1.2 adds
+
+    PHP5 compatibility (non ZTS)
+    full ZTS compatibility
+    and some other small fixes
+
+Hardening Patch v0.1.1 adds
+
+    memory_limit check relocation
+    and some other small fixes
+
+Hardening Patch v0.1.0 implements
+
+    Canary protection of the Zend Memory Manager
+    Canary protection of Zend Linked Lists
+    Protection against internal format string exploits
+    Protection against arbitrary code inclusion
+    Syslog logging of attackers IP
+
+
